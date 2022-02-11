@@ -624,7 +624,7 @@ class PGExplainer(nn.Module):
         self.__clear_masks__()
         return probs, edge_mask
 
-    def train_explanation_network(self, dataset, precompute_netx=False, large_dataset=False):
+    def train_explanation_network(self, dataset, precompute_netx=False, large_dataset=False, batch_size=512):
         r""" training the explanation network by gradient descent(GD) using Adam optimizer """
         optimizer = Adam(self.elayers.parameters(), lr=self.lr)
         if self.explain_graph:
@@ -678,7 +678,7 @@ class PGExplainer(nn.Module):
                 else:
                     print("getting logits")
                     tmp = Data(x=data.x, edge_index=data.edge_index)
-                    kwargs = {'batch_size': 512, 'num_workers': 6, "pin_memory": True}
+                    kwargs = {'batch_size': batch_size, 'num_workers': 6, "pin_memory": True}
                     tmp = NeighborLoader(tmp, input_nodes=None, num_neighbors=[-1], **kwargs)
                     tmp.data.n_id = torch.arange(tmp.data.num_nodes)
                     #acc , _ = fw.predict(tmp, mask=tmp.data.test_mask, return_metrics=True)
