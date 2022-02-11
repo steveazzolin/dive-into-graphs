@@ -15,12 +15,13 @@ from textwrap import wrap
 from torch.optim import Adam
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
-from torch_geometric.data import Data
+from torch_geometric.data import Data, InMemoryDataset, Dataset
+from torch_geometric.loader import NeighborLoader, DataLoader
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import to_networkx
 from torch_geometric.utils.num_nodes import maybe_num_nodes
 from typing import Tuple, List, Dict, Optional
-from .shapley import gnn_score, GnnNetsNC2valueFunc, GnnNetsGC2valueFunc, sparsity
+from .shapley import DummyDataset, gnn_score, GnnNetsNC2valueFunc, GnnNetsGC2valueFunc, sparsity
 from torch_geometric.datasets import MoleculeNet
 from rdkit import Chem
 
@@ -385,11 +386,12 @@ class PGExplainer(nn.Module):
       :class:`torch_geometric.nn.MessagePassing` layers in the :attr:`model`.
 
     """
-    def __init__(self, model, in_channels: int, device, explain_graph: bool = True, epochs: int = 20,
+    def __init__(self, model, framework, in_channels: int, device, explain_graph: bool = True, epochs: int = 20,
                  lr: float = 0.005, coff_size: float = 0.01, coff_ent: float = 5e-4,
                  t0: float = 5.0, t1: float = 1.0, num_hops: Optional[int] = None):
         super(PGExplainer, self).__init__()
         self.model = model
+        self.framework = framework
         self.device = device
         self.model.to(self.device)
         self.in_channels = in_channels
@@ -555,6 +557,7 @@ class PGExplainer(nn.Module):
                 embed: Tensor,
                 tmp: float = 1.0,
                 training: bool = False,
+                large_dataset: bool = False,
                 **kwargs)\
             -> Tuple[float, Tensor]:
         r""" explain the GNN behavior for graph with explanation network
@@ -606,15 +609,22 @@ class PGExplainer(nn.Module):
         self.__clear_masks__()
         self.__set_masks__(x, edge_index, edge_mask)
 
-        # the model prediction with edge mask
-        tmp = Data(x=x, edge_index=edge_index)
-        logits = self.model(tmp)
-        probs = F.softmax(logits, dim=-1)
 
+        if not large_dataset:
+            tmp = DummyDataset(Data(x=x, edge_index=edge_index))
+            _ , logits = self.framework.predict(tmp, torch.ones(len(tmp.data.x), dtype=bool), return_logits=True)
+        else:
+            tmp = Data(x=x, edge_index=edge_index)
+            kwargs = {'batch_size': 512, 'num_workers': 4, "pin_memory": True}
+            tmp = NeighborLoader(tmp, input_nodes=None, num_neighbors=[-1], **kwargs)
+            tmp.data.n_id = torch.arange(tmp.data.num_nodes)
+            logits = self.model.inference(tmp.data.x, tmp, self.device)
+            
+        probs = F.softmax(logits, dim=-1)
         self.__clear_masks__()
         return probs, edge_mask
 
-    def train_explanation_network(self, dataset, precompute_netx=False, precompute_embds=True):
+    def train_explanation_network(self, dataset, precompute_netx=False, large_dataset=False):
         r""" training the explanation network by gradient descent(GD) using Adam optimizer """
         optimizer = Adam(self.elayers.parameters(), lr=self.lr)
         if self.explain_graph:
@@ -655,20 +665,34 @@ class PGExplainer(nn.Module):
         else:
             with torch.no_grad():
                 data = dataset[0]
-                data.to(self.device)
+                #data.to(self.device)
                 self.model.eval()
                 explain_node_index_list = torch.where(data.train_mask)[0].tolist()
                 pred_dict = {}
-                tmp = Data(x=data.x, edge_index=data.edge_index)
-                logits = self.model(tmp)
+                tmp = data #Data(x=data.x, edge_index=data.edge_index)
+
+                if not large_dataset:
+                    #tmp = Data(x=data.x, edge_index=data.edge_index)
+                    #logits = self.model(tmp)
+                    _ , logits = self.framework.predict(self.framework.train_loader, torch.ones(len(data.x), dtype=bool), return_logits=True)
+                else:
+                    print("getting logits")
+                    tmp = Data(x=data.x, edge_index=data.edge_index)
+                    kwargs = {'batch_size': 512, 'num_workers': 6, "pin_memory": True}
+                    tmp = NeighborLoader(tmp, input_nodes=None, num_neighbors=[-1], **kwargs)
+                    tmp.data.n_id = torch.arange(tmp.data.num_nodes)
+                    #acc , _ = fw.predict(tmp, mask=tmp.data.test_mask, return_metrics=True)
+                    logits = self.model.inference(tmp.data.x, tmp, self.device)
+                    print("logits computed")
+                
                 for node_idx in tqdm.tqdm(explain_node_index_list):
                     pred_dict[node_idx] = logits[node_idx].argmax(-1).item()
 
+            print("ntex")
             G_netx = None
             if precompute_netx:
-                G_netx = to_networkx(data=Data(x=data.x, edge_index=data.edge_index), to_undirected=True)
-            if precompute_embds:
-                emb = self.model.get_emb(Data(x=data.x, edge_index=data.edge_index))
+                G_netx = to_networkx(data=data, to_undirected=True)
+            print("end ntex")
 
             # train the mask generator
             duration = 0.0
@@ -680,12 +704,10 @@ class PGExplainer(nn.Module):
                 tic = time.perf_counter()
                 for iter_idx, node_idx in tqdm.tqdm(enumerate(explain_node_index_list), total=len(explain_node_index_list)):
                     with torch.no_grad():
-                        x, edge_index, y, subset, _, _ = \
-                            self.get_subgraph(node_idx=node_idx, x=data.x, edge_index=data.edge_index, y=data.y, graph_netx=G_netx)
-                        if precompute_embds == False:
-                            emb = self.model.get_emb(Data(x=data.x, edge_index=data.edge_index))
+                        x, edge_index, y, subset, _, _ = self.get_subgraph(node_idx=node_idx, x=data.x, edge_index=data.edge_index, y=data.y, graph_netx=G_netx)                        
+                        emb = self.get_dataset_embeddings(Data(x=data.x, edge_index=data.edge_index), large_dataset)
                         new_node_index = int(torch.where(subset == node_idx)[0])
-                    pred, edge_mask = self.explain(x, edge_index, emb, tmp, training=True, node_idx=new_node_index)
+                    pred, edge_mask = self.explain(x, edge_index, emb, tmp, training=True, node_idx=new_node_index, large_dataset=large_dataset)
                     loss_tmp = self.__loss__(pred[new_node_index], pred_dict[node_idx])
                     loss_tmp.backward(retain_graph=True)
                     loss += loss_tmp.detach()
@@ -696,11 +718,21 @@ class PGExplainer(nn.Module):
             print(f"training time is {duration:.5}s")
             return loss.item()/len(explain_node_index_list)
 
+
+    def get_dataset_embeddings(self, data, dataset_large):
+        print("getting emb")
+        if dataset_large:
+            raise NotImplementedError("sasasa")
+        else:
+            emb = self.framework.get_emb(data)
+        return emb
+
+
     def forward(self,
-                x: Tensor,
-                edge_index: Tensor,
+                dataset: Dataset,
                 logits: Optional[Tensor] = None,
                 embed: Optional[Tensor] = None,
+                large_dataset: Optional[bool] = False,
                 **kwargs)\
             -> Tuple[None, List, List[Dict]]:
         r""" explain the GNN behavior for graph and calculate the metric values.
@@ -723,16 +755,19 @@ class PGExplainer(nn.Module):
         
         self.__clear_masks__()
         if logits is None:
-            data = Data(x=x.to(self.device), edge_index=edge_index.to(self.device))
-            logits = self.model(data)
+            _ , logits = self.framework.predict(dataset, torch.ones(len(dataset.data), dtype=bool), return_logits=True)
         probs = F.softmax(logits, dim=-1)
         pred_labels = probs.argmax(dim=-1)
-        if embed is None:
-            embed = self.model.get_emb(data)
+
+        x = dataset.data.x
+        edge_index = dataset.data.edge_index
 
         if self.explain_graph:
             x = x.to(self.device)
             edge_index = edge_index.to(self.device)
+
+            if embed is None:
+                embed = self.get_dataset_embeddings(dataset.data, large_dataset)
 
             # original value
             probs = probs.squeeze()
@@ -740,19 +775,19 @@ class PGExplainer(nn.Module):
             # masked value
             _ , edge_mask = self.explain(x, edge_index, embed=embed, tmp=1.0, training=False)
             #data = Data(x=x, edge_index=edge_index)
-            selected_nodes = calculate_selected_nodes(data, edge_mask, top_k)
-            masked_node_list = [node for node in range(data.x.shape[0]) if node in selected_nodes]
-            maskout_nodes_list = [node for node in range(data.x.shape[0]) if node not in selected_nodes]
+            selected_nodes = calculate_selected_nodes(dataset.data, edge_mask, top_k)
+            masked_node_list = [node for node in range(dataset.data.x.shape[0]) if node in selected_nodes]
+            maskout_nodes_list = [node for node in range(dataset.data.x.shape[0]) if node not in selected_nodes]
             value_func = GnnNetsGC2valueFunc(self.model, target_class=label)
 
-            masked_pred = gnn_score(masked_node_list, data,
+            masked_pred = gnn_score(masked_node_list, dataset.data,
                                     value_func=value_func,
                                     subgraph_building_method='zero_filling')
 
-            maskout_pred = gnn_score(maskout_nodes_list, data, value_func,
+            maskout_pred = gnn_score(maskout_nodes_list, dataset.data, value_func,
                                      subgraph_building_method='zero_filling')
 
-            sparsity_score = 1 - len(selected_nodes) / data.x.shape[0]
+            sparsity_score = 1 - len(selected_nodes) / dataset.data.x.shape[0]
 
         else:
             node_idx = kwargs.get('node_idx')
@@ -765,14 +800,14 @@ class PGExplainer(nn.Module):
             new_node_idx = torch.where(subset == node_idx)[0]
 
             data = Data(x=x, edge_index=edge_index)
-            embed = self.model.get_emb(data)
-            _, edge_mask = self.explain(x, edge_index, embed, tmp=1.0, training=False, node_idx=new_node_idx)
+            embed = self.get_dataset_embeddings(data, large_dataset)
+            _, edge_mask = self.explain(x, edge_index, embed, tmp=1.0, training=False, node_idx=new_node_idx, large_dataset=large_dataset)
 
             
             selected_nodes = calculate_selected_nodes(data, edge_mask, top_k)
             masked_node_list = [node for node in range(data.x.shape[0]) if node in selected_nodes]
             maskout_nodes_list = [node for node in range(data.x.shape[0]) if node not in selected_nodes]
-            value_func = GnnNetsNC2valueFunc(self.model,
+            value_func = GnnNetsNC2valueFunc(self.framework,
                                              node_idx=new_node_idx,
                                              target_class=label)
 

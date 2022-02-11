@@ -19,13 +19,14 @@ def GnnNetsGC2valueFunc(gnnNets, target_class):
     return value_func
 
 
-def GnnNetsNC2valueFunc(gnnNets_NC, node_idx, target_class):
-    def value_func(data):
+def GnnNetsNC2valueFunc(framework, node_idx, target_class):
+    def value_func(dataset):
         with torch.no_grad():
-            logits = gnnNets_NC(data=data)
+            #logits = gnnNets_NC(data=data)
+            _ , logits = framework.predict(dataset, torch.ones(len(dataset.data.x), dtype=bool), return_logits=True)
             probs = F.softmax(logits, dim=-1)
             # select the corresponding node prob through the node idx on all the sampling graphs
-            batch_size = data.batch.max() + 1
+            batch_size = dataset.data.batch.max() + 1
             probs = probs.reshape(batch_size, -1, probs.shape[-1])
             score = probs[:, node_idx, target_class]
             return score
@@ -221,6 +222,11 @@ def mc_l_shapley(coalition: list, data: Data, local_radius: int,
     mc_l_shapley_value = (marginal_contributions).mean().item()
     return mc_l_shapley_value
 
+from torch_geometric.data import InMemoryDataset
+class DummyDataset(InMemoryDataset):
+    def __init__(self, data):
+        super().__init__(None, None, None, None)
+        self.data = data
 
 def gnn_score(coalition: list, data: Data, value_func: str,
               subgraph_building_method='zero_filling') -> torch.Tensor:
@@ -232,7 +238,8 @@ def gnn_score(coalition: list, data: Data, value_func: str,
     ret_x, ret_edge_index = subgraph_build_func(data.x, data.edge_index, mask)
     mask_data = Data(x=ret_x, edge_index=ret_edge_index)
     mask_data = Batch.from_data_list([mask_data])
-    score = value_func(mask_data)
+    dataset = DummyDataset(mask_data)
+    score = value_func(dataset)
     # get the score of predicted class for graph or specific node idx
     return score.item()
 
