@@ -486,7 +486,6 @@ class PGExplainer(nn.Module):
         edge_mask = edge_mask * 0.99 + 0.005
         mask_ent = - edge_mask * torch.log(edge_mask) - (1 - edge_mask) * torch.log(1 - edge_mask)
         mask_ent_loss = self.coff_ent * torch.mean(mask_ent)
-
         loss = pred_loss + size_loss + mask_ent_loss
         return loss
 
@@ -611,8 +610,13 @@ class PGExplainer(nn.Module):
 
 
         if not large_dataset:
-            tmp = DummyDataset(Data(x=x, edge_index=edge_index))
-            _ , logits = self.framework.predict(tmp, torch.ones(len(tmp.data.x), dtype=bool), return_logits=True)
+            if self.explain_graph:
+                tmp = DummyDataset(Data(x=x, edge_index=edge_index, y=torch.zeros(x.shape[0], dtype=torch.int)))
+                data_loader = DataLoader(tmp)
+                _ , logits = self.framework.predict(data_loader, return_logits=True)
+            else:
+                tmp = DummyDataset(Data(x=x, edge_index=edge_index))
+                _ , logits = self.framework.predict(tmp, torch.ones(len(tmp.data.x), dtype=bool), return_logits=True)
         else:
             tmp = Data(x=x, edge_index=edge_index)
             kwargs = {'batch_size': 512, 'num_workers': 4, "pin_memory": True}
@@ -627,16 +631,23 @@ class PGExplainer(nn.Module):
     def train_explanation_network(self, dataset, precompute_netx=False, large_dataset=False, batch_size=512):
         r""" training the explanation network by gradient descent(GD) using Adam optimizer """
         optimizer = Adam(self.elayers.parameters(), lr=self.lr)
+        data_loader = DataLoader(dataset,batch_size=1)
         if self.explain_graph:
             with torch.no_grad():
                 dataset_indices = list(range(len(dataset)))
                 self.model.eval()
                 emb_dict = {}
                 ori_pred_dict = {}
-                for gid in tqdm.tqdm(dataset_indices):
-                    data = dataset[gid].to(self.device)
-                    logits = self.model(data.x, data.edge_index)
-                    emb = self.model.get_emb(Data(x=data.x, edge_index=data.edge_index))
+                # for gid in tqdm.tqdm(dataset_indices):
+                #     data = dataset[gid].to(self.device)
+                #     logits = self.model(data)
+                #     emb = self.model.get_emb(Data(x=data.x, edge_index=data.edge_index))
+                #     emb_dict[gid] = emb.data.cpu()
+                #     ori_pred_dict[gid] = logits.argmax(-1).data.cpu()
+                for gid , data in enumerate(data_loader):
+                    data = data.to(self.device)
+                    logits = self.model(data)
+                    emb = self.model.get_emb(data)
                     emb_dict[gid] = emb.data.cpu()
                     ori_pred_dict[gid] = logits.argmax(-1).data.cpu()
 
@@ -688,11 +699,11 @@ class PGExplainer(nn.Module):
                 for node_idx in tqdm.tqdm(explain_node_index_list):
                     pred_dict[node_idx] = logits[node_idx].argmax(-1).item()
 
-            print("ntex")
+            print("Generating networkx graph")
             G_netx = None
             if precompute_netx:
                 G_netx = to_networkx(data=data, to_undirected=True)
-            print("end ntex")
+            print("End")
 
             # train the mask generator
             duration = 0.0
@@ -704,7 +715,7 @@ class PGExplainer(nn.Module):
                 tic = time.perf_counter()
                 for iter_idx, node_idx in tqdm.tqdm(enumerate(explain_node_index_list), total=len(explain_node_index_list)):
                     with torch.no_grad():
-                        x, edge_index, y, subset, _, _ = self.get_subgraph(node_idx=node_idx, x=data.x, edge_index=data.edge_index, y=data.y, graph_netx=G_netx)                        
+                        x, edge_index, y, subset, _, _ = self.get_subgraph(node_idx=node_idx, x=data.x, edge_index=data.edge_index, y=data.y, graph_netx=G_netx)
                         emb = self.get_dataset_embeddings(Data(x=data.x, edge_index=data.edge_index), large_dataset)
                         new_node_index = int(torch.where(subset == node_idx)[0])
                     pred, edge_mask = self.explain(x, edge_index, emb, tmp, training=True, node_idx=new_node_index, large_dataset=large_dataset)
@@ -720,7 +731,7 @@ class PGExplainer(nn.Module):
 
 
     def get_dataset_embeddings(self, data, dataset_large):
-        print("getting emb")
+        #print("getting emb")
         if dataset_large:
             raise NotImplementedError("sasasa")
         else:
@@ -804,31 +815,32 @@ class PGExplainer(nn.Module):
             _, edge_mask = self.explain(x, edge_index, embed, tmp=1.0, training=False, node_idx=new_node_idx, large_dataset=large_dataset)
 
             
-            selected_nodes = calculate_selected_nodes(data, edge_mask, top_k)
-            masked_node_list = [node for node in range(data.x.shape[0]) if node in selected_nodes]
-            maskout_nodes_list = [node for node in range(data.x.shape[0]) if node not in selected_nodes]
-            value_func = GnnNetsNC2valueFunc(self.framework,
-                                             node_idx=new_node_idx,
-                                             target_class=label)
+            # selected_nodes = calculate_selected_nodes(data, edge_mask, top_k)
+            # masked_node_list = [node for node in range(data.x.shape[0]) if node in selected_nodes]
+            # maskout_nodes_list = [node for node in range(data.x.shape[0]) if node not in selected_nodes]
+            # value_func = GnnNetsNC2valueFunc(self.framework,
+            #                                  node_idx=new_node_idx,
+            #                                  target_class=label)
 
-            masked_pred = gnn_score(masked_node_list, data,
-                                    value_func=value_func,
-                                    subgraph_building_method='zero_filling')
+            # masked_pred = gnn_score(masked_node_list, data,
+            #                         value_func=value_func,
+            #                         subgraph_building_method='zero_filling')
 
-            maskout_pred = gnn_score(maskout_nodes_list, data,
-                                     value_func=value_func,
-                                     subgraph_building_method='zero_filling')
+            # maskout_pred = gnn_score(maskout_nodes_list, data,
+            #                          value_func=value_func,
+            #                          subgraph_building_method='zero_filling')
 
-            sparsity_score = sparsity(masked_node_list, data,
-                                      subgraph_building_method='zero_filling')
+            # sparsity_score = sparsity(masked_node_list, data,
+            #                           subgraph_building_method='zero_filling')
 
         # return variables
         pred_mask = [edge_mask]
         related_preds = [{
-            'masked': masked_pred,
-            'maskout': maskout_pred,
-            'origin': probs[label],
-            'sparsity': sparsity_score}]
+            'masked': np.nan, #masked_pred,   commented because the function 'calculate_selected_nodes' returned error for GAT on CITESEER, probably due to an empty list of edges
+            'maskout': np.nan, #maskout_pred,
+            'origin': np.nan, #probs[label],
+            'sparsity': np.nan, # sparsity_score
+            }]
         return None, pred_mask, related_preds, edge_index
 
     def visualization(self, data: Data, edge_mask: Tensor, top_k: int, plot_utils: PlotUtils,
