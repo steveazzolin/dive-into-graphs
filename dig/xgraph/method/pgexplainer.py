@@ -666,13 +666,14 @@ class PGExplainer(nn.Module):
                     prob, edge_mask = self.explain(data.x, data.edge_index, embed=emb_dict[gid], tmp=tmp, training=True)
                     loss_tmp = self.__loss__(prob.squeeze(), ori_pred_dict[gid])
                     loss_tmp.backward()
-                    loss += loss_tmp.item()
+                    loss += loss_tmp.detach() #.item()
                     pred_label = prob.argmax(-1).item()
                     pred_list.append(pred_label)
 
                 optimizer.step()
                 duration += time.perf_counter() - tic
-                print(f'Epoch: {epoch} | Loss: {loss}')
+                print(f'Epoch: {epoch} | Loss: {loss.item() / len(dataset_indices)}')
+            return loss.item() / len(dataset_indices)
         else:
             with torch.no_grad():
                 data = dataset[0]
@@ -761,24 +762,23 @@ class PGExplainer(nn.Module):
         :rtype: (:obj:`None`, List[torch.Tensor], List[Dict])
         """
         # set default subgraph with 10 edges
-        top_k = kwargs.get('top_k') if kwargs.get('top_k') is not None else 10
-        
+        top_k = kwargs.get('top_k') if kwargs.get('top_k') is not None else 10       
         
         self.__clear_masks__()
         if logits is None:
             _ , logits = self.framework.predict(dataset, torch.ones(len(dataset.data), dtype=bool), return_logits=True)
         probs = F.softmax(logits, dim=-1)
-        pred_labels = probs.argmax(dim=-1)
-
-        x = dataset.data.x
-        edge_index = dataset.data.edge_index
+        pred_labels = probs.argmax(dim=-1)        
 
         if self.explain_graph:
+            x = dataset.x
+            edge_index = dataset.edge_index
+
             x = x.to(self.device)
             edge_index = edge_index.to(self.device)
 
             if embed is None:
-                embed = self.get_dataset_embeddings(dataset.data, large_dataset)
+                embed = self.get_dataset_embeddings(dataset, large_dataset)
 
             # original value
             probs = probs.squeeze()
@@ -786,21 +786,24 @@ class PGExplainer(nn.Module):
             # masked value
             _ , edge_mask = self.explain(x, edge_index, embed=embed, tmp=1.0, training=False)
             #data = Data(x=x, edge_index=edge_index)
-            selected_nodes = calculate_selected_nodes(dataset.data, edge_mask, top_k)
-            masked_node_list = [node for node in range(dataset.data.x.shape[0]) if node in selected_nodes]
-            maskout_nodes_list = [node for node in range(dataset.data.x.shape[0]) if node not in selected_nodes]
+            selected_nodes = calculate_selected_nodes(dataset, edge_mask, top_k)
+            masked_node_list = [node for node in range(dataset.x.shape[0]) if node in selected_nodes]
+            maskout_nodes_list = [node for node in range(dataset.x.shape[0]) if node not in selected_nodes]
             value_func = GnnNetsGC2valueFunc(self.model, target_class=label)
 
-            masked_pred = gnn_score(masked_node_list, dataset.data,
-                                    value_func=value_func,
-                                    subgraph_building_method='zero_filling')
+            # masked_pred = gnn_score(masked_node_list, dataset.data,
+            #                         value_func=value_func,
+            #                         subgraph_building_method='zero_filling')
 
-            maskout_pred = gnn_score(maskout_nodes_list, dataset.data, value_func,
-                                     subgraph_building_method='zero_filling')
+            # maskout_pred = gnn_score(maskout_nodes_list, dataset.data, value_func,
+            #                          subgraph_building_method='zero_filling')
 
-            sparsity_score = 1 - len(selected_nodes) / dataset.data.x.shape[0]
+            # sparsity_score = 1 - len(selected_nodes) / dataset.data.x.shape[0]
 
         else:
+            x = dataset.data.x
+            edge_index = dataset.data.edge_index
+
             node_idx = kwargs.get('node_idx')
             assert kwargs.get('node_idx') is not None, "please input the node_idx"
             # original value
